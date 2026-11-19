@@ -12,8 +12,9 @@ blend/
   catalog.py    独立原料质量目录（SQLite，原子修订，质量边界产品）
   planner.py    整数混配规划器（精确分支定界）+ 独立全枚举核对器
   warehouse.py  履约仓（预览/确认事务锁、领料/退回/取消状态机、台账）
-tests/          31 个 unittest 用例（含 300 例随机实例与全枚举一致性核对）
-demo.py         八个端到端场景演示
+  trace.py      实物包谱系（分装/混合/外发/退回、幂等追溯、定向召回）
+tests/          43 个 unittest 用例（含 300 例随机实例与全枚举一致性核对）
+demo.py         九个端到端场景演示
 ```
 
 ## 运行
@@ -84,7 +85,96 @@ brute_force_best(order, lots)         # 独立第二条实现：笛卡尔积全�
 5. 预览不占料 → 确认 → 部分领料 → 取消只放未领 → 退回留痕；
 6. 两个独立线程/连接抢最后 10g 库存，恰好一个成功、审计无双花；
 7. 质量换代：旧预览拒绝、按新质量重新规划、旧确认保持 rev1 来源；
-8. 12 批/M=300/4 成分最大规模性能，以及小库存分支定界 vs 全枚举最优性核对。
+8. 12 批/M=300/4 成分最大规模性能，以及小库存分支定界 vs 全枚举最优性核对；
+9. 实物包谱系：分装/混合的精确分数贡献、外发/退回、按记录位置的定向召回。
+
+## 实物包层 `blend.trace.PhysicalTrace`
+
+在原履约库上**增量启用**（共享同一 SQLite 连接），不改变既有普通领料入口：
+
+| 入口 | 语义 |
+| --- | --- |
+| `PhysicalTrace(warehouse)` | 启用实物层；构造时把历史 `ISSUE` 台账补登记 |
+| `split(op_id, parent, children)` | 1 父 → N 子，等比例分装，精确有理数贡献 |
+| `mix(op_id, parents, grams)` | N 父 → 1 子，均匀混合，贡献逐根 lot 求和 |
+| `operate(op_id, kind, parents, children)` | 通用入口，一次只能分或只能混 |
+| `ship(shipment_id, package_id, recipient)` | 外发**一个完整活动包**（部分外发须先 `split`） |
+| `return_shipment(shipment_id, recipient=None)` | 按当前持有者的发运记录退回同一包，收回后可重发 |
+| `recall(root_lot, position=None)` | 指定记录位置仍在外的包、收件方、暴露克数与谱系路径 |
+| `contact_list(root_lot, min_grams, position=None)` | 按收件方累计贡献，达到门槛才列入待联系清单 |
+| `package / packages / routes_for / journal` | 仓内、在外、已退回、已耗用中间包及路径查询 |
+
+- **首次实物包**：`Warehouse.issue` 在同一事务内调用实物层钩子，生成
+  `PKG-ISSUE-<ledger_id>`，来源为该 lot、贡献即领出克数。启用前已存在的
+  领料登记为 `UNREFINED`（来源未细分），**无已知根 lot 贡献、不进入在外
+  累计、不能外发/加工**，从而不会冒认已知去向。
+- **守恒与精确有理数**：`split` 子包贡献 = 父包贡献 × 子克数/父克数；
+  `mix` 子包贡献 = 各父贡献之和；操作前后总克数必须相等。三种根 lot
+  贡献全程用 `Fraction`（如 `12/5`、`18/5`）。
+- **整包耗用 + 幂等 + 并发**：父包被整包置为 `CONSUMED`。`op_id` 为幂等
+  键：同编号同内容重放读回原收据，异文抛 `StateError`。耗用父包在
+  `BEGIN IMMEDIATE` 写锁内复核状态，并发双耗只有一个成功，失败方整体
+  回滚、不留任何子包，父包保持原状态可继续使用。
+- **外发/退回**：`ship` 只接受完整活动包；`return_shipment` 把该运输包
+  收回仓内并可重发，不改变 `wh_lots` 库存（区别于 `return_material`）。
+- **召回时间点**：以自增 journal 的 `position` 表示记录位置。`recall` 只
+  统计 `shipped_pos <= P` 且 `P` 前未退回的包；仓内、已退回、已耗用、来源
+  未细分都不进入在外累计。历史位置在关闭重开后仍能复现同样的清单。
+
+### 复现步骤（题面例子）
+
+```python
+from fractions import Fraction
+from blend.catalog import QualityCatalog
+from blend.model import PlannedLot, PlanResult
+from blend.planner import evaluate_usage
+from blend.trace import PhysicalTrace
+from blend.warehouse import Warehouse
+from tests.factories import make_lot, make_order
+
+cat = QualityCatalog(":memory:")
+lots = [make_lot("A", 500, {"c1": ("0", "1")}),
+        make_lot("B", 500, {"c1": ("0", "1")})]
+cat.replace_lots(lots)
+wh = Warehouse(":memory:", cat); wh.register_lots(lots)
+tr = PhysicalTrace(wh)                      # 既有库上增量启用
+
+# 1) 按 A6+B4 确认并领料，生成首次实物包
+usage = {"A": 6, "B": 4}
+order = make_order("O1", 10, {"c1": ("0", "1")})
+plan = PlanResult("O1", 10,
+                  tuple(PlannedLot(l.lot_id, usage[l.lot_id], l.step_g,
+                                   l.cost_per_g, l.fixed_fee) for l in lots),
+                  evaluate_usage(lots, usage), 0, 2, "manual")
+wh.confirm_preview(wh.preview_external(order, plan))
+for lot, g in usage.items():
+    wh.issue("O1", lot, g)
+pk = {p.lot_id: p.package_id for p in tr.packages() if p.state == "IN_STOCK"}
+
+# 2) 混合成 10g，再分 X 4g / Y 6g
+mixed = tr.mix("MIX", [pk["A"], pk["B"]], 10)
+split = tr.split("SPLIT", mixed.children[0][0], [4, 6])
+X, Y = split.children[0][0], split.children[1][0]
+assert tr.package_content_dict(X)["A"] == Fraction(12, 5)
+assert tr.package_content_dict(Y)["A"] == Fraction(18, 5)
+
+# 3) X、Y 均在甲处：5g 门槛命中；退回 X 后不再命中
+tr.ship("S-X", X, "甲"); tr.ship("S-Y", Y, "甲")
+p_both = tr.current_position()
+assert [e.recipient for e in tr.contact_list("A", 5)] == ["甲"]   # 6g
+tr.return_shipment("S-X", "甲")
+assert tr.contact_list("A", 5) == ()
+
+# 4) X 改发乙：当前乙 12/5、甲 18/5；旧时点仍找到甲当时的 6g
+tr.ship("S-X2", X, "乙")
+low = {e.recipient: e.exposure for e in tr.contact_list("A", 2)}
+assert low == {"甲": Fraction(18, 5), "乙": Fraction(12, 5)}
+assert tr.contact_list("A", 5, p_both)[0].exposure == Fraction(6)
+```
+
+> `demo.py` 场景 9 是可直接运行的完整版本。运行
+> `python3 -m unittest tests.test_trace -v` 验证全部用例，其中包含
+> 「失败后原包依旧可用」「并发双耗无残留」「关闭重开复现」等检查。
 
 ## 关键设计取舍
 

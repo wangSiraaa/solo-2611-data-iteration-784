@@ -10,6 +10,7 @@
   6. 并发争料：两个独立连接抢最后库存，恰好一个成功
   7. 质量换代：旧预览被拒、重新规划、旧确认保持来源
   8. 最大规模（12 批 / M=300 / 4 成分）性能与全枚举核对
+  9. 实物包谱系：分装/混合精确分数、外发退回、按记录位置的定向召回
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from blend.model import (
     StalePreviewError,
 )
 from blend.planner import Planner, brute_force_best, evaluate_usage, explain_plan
+from blend.trace import PhysicalTrace, ST_IN_STOCK
 from blend.warehouse import Warehouse
 from tests.factories import make_lot, make_order
 
@@ -337,6 +339,75 @@ def demo_max_scale_and_brute_force() -> None:
     print("两者完全一致，最优性得到独立枚举确认。")
 
 
+def demo_physical_trace_and_recall() -> None:
+    section("场景 9｜实物包谱系、外发退回与定向召回")
+    cat = QualityCatalog(":memory:")
+    lots = [
+        make_lot("A", 500, {"c1": ("0", "1")}),
+        make_lot("B", 500, {"c1": ("0", "1")}),
+    ]
+    cat.replace_lots(lots)
+    wh = Warehouse(":memory:", cat)
+    wh.register_lots(lots)
+    tr = PhysicalTrace(wh)
+
+    # 用外部质量产品固定用量：A 6g + B 4g
+    from blend.model import PlanResult, PlannedLot
+    from blend.planner import evaluate_usage
+
+    usage = {"A": 6, "B": 4}
+    order = make_order("PT1", 10, {"c1": ("0", "1")}, max_lots=2)
+    product = evaluate_usage(lots, usage, source="manual")
+    planned = tuple(
+        PlannedLot(l.lot_id, usage.get(l.lot_id, 0), l.step_g, l.cost_per_g, l.fixed_fee)
+        for l in lots
+    )
+    pv = wh.preview_external(
+        order, PlanResult("PT1", 10, planned, product, 0, 2, "manual")
+    )
+    wh.confirm_preview(pv)
+    wh.issue("PT1", "A", 6)
+    wh.issue("PT1", "B", 4)
+    pkgs = {p.lot_id: p.package_id for p in tr.packages() if p.state == ST_IN_STOCK}
+    print("领料生成首次实物包:", pkgs)
+
+    mixed = tr.mix("MIX-1", [pkgs["A"], pkgs["B"]], 10)
+    split = tr.split("SPLIT-1", mixed.children[0][0], [4, 6])
+    x, y = split.children[0][0], split.children[1][0]
+    for pid in (x, y):
+        print(f"  {pid}: " + ", ".join(
+            f"{c.root_lot}={c.grams}" for c in tr.package_content(pid)
+        ))
+
+    tr.ship("SHIP-X", x, "甲")
+    tr.ship("SHIP-Y", y, "甲")
+    p_both = tr.current_position()
+    print("甲持有 X+Y 时 5g 门槛待联系:", [(e.recipient, str(e.exposure))
+                                             for e in tr.contact_list("A", 5)])
+
+    tr.return_shipment("SHIP-X", "甲")
+    print("甲退回 X 后 5g 门槛待联系:", tr.contact_list("A", 5))
+
+    tr.ship("SHIP-X2", x, "乙")
+    print("X 改发乙后当前 2g 门槛:", [(e.recipient, str(e.exposure))
+                                     for e in tr.contact_list("A", 2)])
+    print("旧时点 p=%d 仍找到甲当时 6g:" % p_both,
+          [(e.recipient, str(e.exposure)) for e in tr.contact_list("A", 5, p_both)])
+
+    print("\n谱系路径（Y 到 A 的首次领料）:")
+    for route in tr.routes_for(y, "A"):
+        print("  " + " -> ".join(s.package_id for s in route))
+
+    # 幂等与失败不残留
+    again = tr.mix("MIX-1", [pkgs["A"], pkgs["B"]], 10)
+    print("\n同编号同内容重放读回原收据:", again == mixed)
+    try:
+        tr.split("SPLIT-1", mixed.children[0][0], [5, 5])
+    except Exception as exc:
+        print("异文重放被拒:", type(exc).__name__)
+    tr.close(); wh.close(); cat.close()
+
+
 def main() -> None:
     demo_catalog_product()
     demo_midpoint_vs_robust()
@@ -346,6 +417,7 @@ def main() -> None:
     demo_concurrent_race()
     demo_quality_generation()
     demo_max_scale_and_brute_force()
+    demo_physical_trace_and_recall()
     print("\n全部演示场景完成。")
 
 

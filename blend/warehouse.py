@@ -225,6 +225,8 @@ class Warehouse:
     ) -> None:
         self.path = str(db_path)
         self.catalog = catalog
+        # 实物包层钩子：PhysicalTrace 在初始化时挂入，issue 事务内调用。
+        self._trace_hook = None
         # check_same_thread=False：演示并发争料时允许多线程共享连接；
         # 写操作仍由 BEGIN IMMEDIATED 的库级写锁串行化。
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
@@ -522,11 +524,16 @@ class Warehouse:
                 " WHERE lot_id=?",
                 (grams, grams, lot_id),
             )
-            conn.execute(
+            ledger_cur = conn.execute(
                 "INSERT INTO wh_ledger(order_id, lot_id, event, grams, created_at, detail)"
                 " VALUES (?,?,?,?,?,?)",
                 (order_id, lot_id, "ISSUE", grams, now, ""),
             )
+            if self._trace_hook is not None:
+                # 与领料同一事务生成首次实物包；失败则领料整体回滚。
+                self._trace_hook(
+                    conn, order_id, lot_id, grams, int(ledger_cur.lastrowid), now
+                )
             self._refresh_order_status(conn, order_id)
             conn.commit()
         except Exception:
